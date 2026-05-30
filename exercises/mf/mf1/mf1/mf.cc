@@ -13,7 +13,7 @@ This is the function you need to implement. Quick reference:
 #include <iostream>
 
 void mf(int ny, int nx, int hy, int hx, const float *in, float *out) {
-
+  #pragma omp parallel for
   for (int y = 0; y < ny; y++) {
     for (int x = 0; x < nx; x++) {
       int count = 0;
