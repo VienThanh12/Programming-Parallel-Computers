@@ -10,19 +10,14 @@ void merge_sort_helper(data_t* data, data_t* temp, int left, int right) {
 
     int mid = left + (right - left) / 2;
 
-    // Create tasks for the recursive calls. 
-    // The 'if' clause prevents creating too many tasks for tiny subarrays, 
-    // which would slow things down due to overhead.
     #pragma omp task shared(data, temp) if(right - left > 10000)
     merge_sort_helper(data, temp, left, mid);
 
     #pragma omp task shared(data, temp) if(right - left > 10000)
     merge_sort_helper(data, temp, mid, right);
 
-    // Wait for both halves to finish sorting before merging
     #pragma omp taskwait
 
-    // The merge step MUST remain sequential
     int i = left;
     int j = mid;
     int k = left;
@@ -53,10 +48,8 @@ void psort(int n, data_t *data) {
 
     std::vector<data_t> temp(n);
 
-    // Start a single parallel region at the very beginning
     #pragma omp parallel
     {
-        // Ensure only one thread kicks off the initial recursive call
         #pragma omp single
         {
             merge_sort_helper(data, temp.data(), 0, n);
