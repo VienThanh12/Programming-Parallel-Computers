@@ -5,43 +5,47 @@
 
 typedef unsigned long long data_t;
 
-int partition(data_t* data, int left, int right) {
-    int mid = left + (right - left) / 2;
-    if (data[mid] < data[left]) std::swap(data[left], data[mid]);
-    if (data[right] < data[left]) std::swap(data[left], data[right]);
-    if (data[right] < data[mid]) std::swap(data[mid], data[right]);
-    
-    std::swap(data[mid], data[right]); 
-    data_t pivot = data[right];
-    
-    int i = left - 1;
-    for (int j = left; j < right; ++j) {
-        if (data[j] < pivot) {
-            ++i;
-            std::swap(data[i], data[j]);
-        }
-    }
-    std::swap(data[i + 1], data[right]);
-    return i + 1;
-}
-
 void quicksort_helper(data_t* data, int left, int right) {
     if (left >= right) {
         return;
     }
 
-    if (right - left < 10000) {
+    if (right - left < 100000) {
         std::sort(data + left, data + right + 1);
         return;
     }
 
-    int pivot_idx = partition(data, left, right);
+    int mid = left + (right - left) / 2;
+    if (data[mid] < data[left]) std::swap(data[left], data[mid]);
+    if (data[right] < data[left]) std::swap(data[left], data[right]);
+    if (data[right] < data[mid]) std::swap(data[mid], data[right]);
+    
+    data_t pivot = data[mid];
+
+    int i = left;
+    int j = left;
+    int k = right;
+
+    while (j <= k) {
+        if (data[j] < pivot) {
+            std::swap(data[i], data[j]);
+            i++;
+            j++;
+        } else if (data[j] > pivot) {
+            std::swap(data[j], data[k]);
+            k--;
+        } else {
+            j++;
+        }
+    }
+
+
 
     #pragma omp task shared(data)
-    quicksort_helper(data, left, pivot_idx - 1);
+    quicksort_helper(data, left, i - 1);
 
     #pragma omp task shared(data)
-    quicksort_helper(data, pivot_idx + 1, right);
+    quicksort_helper(data, k + 1, right);
 
     #pragma omp taskwait
 }
