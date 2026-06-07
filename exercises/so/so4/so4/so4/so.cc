@@ -1,58 +1,51 @@
 #include <iostream>
 #include <vector>
-#include <omp.h> 
+#include <algorithm>
+#include <omp.h>
+
 typedef unsigned long long data_t;
 
-void merge_sort_helper(data_t* data, data_t* temp, int left, int right) {
-    if (right - left <= 1) {
+static const int SORT_CUTOFF = 50000;
+
+void merge_sort(data_t* data, data_t* buf, int left, int right, int depth) {
+    int len = right - left;
+    if (len <= SORT_CUTOFF) {
+        std::sort(data + left, data + right);
         return;
     }
 
-    int mid = left + (right - left) / 2;
+    int mid = left + len / 2;
 
-    #pragma omp task shared(data, temp) if(right - left > 10000)
-    merge_sort_helper(data, temp, left, mid);
+    if (depth > 0) {
+        #pragma omp task shared(data, buf)
+        merge_sort(data, buf, left, mid, depth - 1);
 
-    #pragma omp task shared(data, temp) if(right - left > 10000)
-    merge_sort_helper(data, temp, mid, right);
+        merge_sort(data, buf, mid, right, depth - 1);
 
-    #pragma omp taskwait
-
-    int i = left;
-    int j = mid;
-    int k = left;
-
-    while (i < mid && j < right) {
-        if (data[i] <= data[j]) {
-            temp[k++] = data[i++];
-        } else {
-            temp[k++] = data[j++];
-        }
+        #pragma omp taskwait
+    } else {
+        merge_sort(data, buf, left, mid, 0);
+        merge_sort(data, buf, mid, right, 0);
     }
 
-    while (i < mid) {
-        temp[k++] = data[i++];
-    }
-
-    while (j < right) {
-        temp[k++] = data[j++];
-    }
-
-    for (int p = left; p < right; ++p) {
-        data[p] = temp[p];
-    }
+    std::merge(data + left, data + mid, data + mid, data + right, buf + left);
+    std::copy(buf + left, buf + right, data + left);
 }
 
 void psort(int n, data_t *data) {
     if (n <= 1) return;
 
-    std::vector<data_t> temp(n);
+    std::vector<data_t> buf(n);
+
+    int depth = 0;
+    int threads = omp_get_max_threads();
+    while ((1 << depth) < threads * 4) {
+        depth++;
+    }
 
     #pragma omp parallel
     {
         #pragma omp single
-        {
-            merge_sort_helper(data, temp.data(), 0, n);
-        }
+        merge_sort(data, buf.data(), 0, n, depth);
     }
 }
