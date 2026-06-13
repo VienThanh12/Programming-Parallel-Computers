@@ -1,0 +1,11 @@
+timeout 30
+seed 65251
+dim 288
+n_layers 6
+hidden_dim 768
+n_heads 6
+vocab_size 2048
+seq_len 2048
+multiplier 3
+modifier default
+num_tokens 2047
