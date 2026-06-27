@@ -1,11 +1,3 @@
-/*
-This is the function you need to implement. Quick reference:
-- input rows: 0 <= y < ny
-- input columns: 0 <= x < nx
-- element at row y and column x is stored in data[x + y*nx]
-- the correlation between rows i and j has to be stored in result[i + j*ny]
-- only elements with 0 <= j <= i < ny need to be filled
-*/
 #include <cmath>
 #include <vector>
 #include <cstddef>
@@ -26,7 +18,6 @@ static inline void storeu(double *p, double4_t v) {
     p[0] = v[0]; p[1] = v[1]; p[2] = v[2]; p[3] = v[3];
 }
 
-// C(m x n) = A(m x k) * B(k x n).  Requires m % 6 == 0 and n % 8 == 0.
 static void base_mul(int m, int k, int n,
                      const double *A, int lda,
                      const double *B, int ldb,
@@ -78,7 +69,6 @@ static void base_mul(int m, int k, int n,
     }
 }
 
-// D(r x c) = A +/- B
 static void madd(int r, int c,
                  const double *A, int lda,
                  const double *B, int ldb,
@@ -92,7 +82,6 @@ static void madd(int r, int c,
     }
 }
 
-// C(m x n) = A(m x k) * B(k x n) using Strassen for `levels` top levels.
 static void strassen(int m, int k, int n,
                      const double *A, int lda,
                      const double *B, int ldb,
@@ -130,38 +119,30 @@ static void strassen(int m, int k, int n,
     std::vector<double> TA(static_cast<size_t>(m2) * k2);
     std::vector<double> TB(static_cast<size_t>(k2) * n2);
 
-    // M1 = (A11 + A22) (B11 + B22)
     madd(m2, k2, A11, lda, A22, lda, +1.0, TA.data(), k2);
     madd(k2, n2, B11, ldb, B22, ldb, +1.0, TB.data(), n2);
     strassen(m2, k2, n2, TA.data(), k2, TB.data(), n2, M1.data(), n2, levels - 1);
 
-    // M2 = (A21 + A22) B11
     madd(m2, k2, A21, lda, A22, lda, +1.0, TA.data(), k2);
     strassen(m2, k2, n2, TA.data(), k2, B11, ldb, M2.data(), n2, levels - 1);
 
-    // M3 = A11 (B12 - B22)
     madd(k2, n2, B12, ldb, B22, ldb, -1.0, TB.data(), n2);
     strassen(m2, k2, n2, A11, lda, TB.data(), n2, M3.data(), n2, levels - 1);
 
-    // M4 = A22 (B21 - B11)
     madd(k2, n2, B21, ldb, B11, ldb, -1.0, TB.data(), n2);
     strassen(m2, k2, n2, A22, lda, TB.data(), n2, M4.data(), n2, levels - 1);
 
-    // M5 = (A11 + A12) B22
     madd(m2, k2, A11, lda, A12, lda, +1.0, TA.data(), k2);
     strassen(m2, k2, n2, TA.data(), k2, B22, ldb, M5.data(), n2, levels - 1);
 
-    // M6 = (A21 - A11) (B11 + B12)
     madd(m2, k2, A21, lda, A11, lda, -1.0, TA.data(), k2);
     madd(k2, n2, B11, ldb, B12, ldb, +1.0, TB.data(), n2);
     strassen(m2, k2, n2, TA.data(), k2, TB.data(), n2, M6.data(), n2, levels - 1);
 
-    // M7 = (A12 - A22) (B21 + B22)
     madd(m2, k2, A12, lda, A22, lda, -1.0, TA.data(), k2);
     madd(k2, n2, B21, ldb, B22, ldb, +1.0, TB.data(), n2);
     strassen(m2, k2, n2, TA.data(), k2, TB.data(), n2, M7.data(), n2, levels - 1);
 
-    // Combine
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < m2; i++) {
         const size_t o = static_cast<size_t>(i) * n2;
@@ -181,16 +162,16 @@ static void strassen(int m, int k, int n,
 }
 
 void correlate(int ny, int nx, const float *data, float *result) {
-    constexpr int LEVELS = 2;
-    constexpr int PADM = (1 << LEVELS) * 48;   // M divisible so base m%6==0, n%8==0
-    constexpr int PADK = (1 << LEVELS);
+    int levels = 0;
+    for (int t = ny; levels < 2 && t >= 2048; t /= 2) levels++;
 
-    const int M = ((ny + PADM - 1) / PADM) * PADM;   // padded rows/cols (square)
-    const int K = ((nx + PADK - 1) / PADK) * PADK;   // padded depth
+    const int PADM = (1 << levels) * 48;
+    const int PADK = (1 << levels);
 
-    // A = normalized data, padded to M x K (extra rows/cols are zero).
+    const int M = ((ny + PADM - 1) / PADM) * PADM;
+    const int K = ((nx + PADK - 1) / PADK) * PADK;
+
     std::vector<double> A(static_cast<size_t>(M) * K, 0.0);
-    // B = A^T, padded to K x M.
     std::vector<double> B(static_cast<size_t>(K) * M, 0.0);
 
     #pragma omp parallel for schedule(static)
@@ -216,7 +197,7 @@ void correlate(int ny, int nx, const float *data, float *result) {
     }
 
     std::vector<double> C(static_cast<size_t>(M) * M);
-    strassen(M, K, M, A.data(), K, B.data(), M, C.data(), M, LEVELS);
+    strassen(M, K, M, A.data(), K, B.data(), M, C.data(), M, levels);
 
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < ny; j++) {
