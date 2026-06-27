@@ -1,95 +1,102 @@
 #include <cmath>
 #include <vector>
-#include <algorithm>
 
 typedef double double4_t __attribute__ ((vector_size (4 * sizeof(double))));
 
 constexpr double4_t d4zero {0.0, 0.0, 0.0, 0.0};
 
-static inline double hsum4(double4_t v) {
-    return v[0] + v[1] + v[2] + v[3];
-}
-
 void correlate(int ny, int nx, const float *data, float *result) {
-    constexpr int nb = 4;
-    const int na = (nx + nb - 1) / nb;
+    constexpr int nb = 4;                     
+    const int nyb = (ny + nb - 1) / nb;         
 
-    std::vector<double4_t> nor(static_cast<size_t>(ny) * na, d4zero);
+    std::vector<double4_t> T(static_cast<size_t>(nyb) * nx, d4zero);
 
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < ny; i++) {
-        const float *row = &data[i * nx];
-        double mean = 0.0;
-        for (int x = 0; x < nx; x++) {
-            mean += row[x];
-        }
-        mean /= static_cast<double>(nx);
+    for (int jb = 0; jb < nyb; jb++) {
+        for (int lane = 0; lane < nb; lane++) {
+            const int i = jb * nb + lane;
+            if (i >= ny) continue;              // padded rows stay zero
 
-        double ss = 0.0;
-        for (int x = 0; x < nx; x++) {
-            double v = static_cast<double>(row[x]) - mean;
-            ss += v * v;
-        }
-        double inv = (ss > 0.0) ? 1.0 / std::sqrt(ss) : 0.0;
+            const float *row = &data[static_cast<size_t>(i) * nx];
+            double mean = 0.0;
+            for (int x = 0; x < nx; x++) mean += row[x];
+            mean /= static_cast<double>(nx);
 
-        double *dst = reinterpret_cast<double *>(&nor[static_cast<size_t>(i) * na]);
-        for (int x = 0; x < nx; x++) {
-            dst[x] = (static_cast<double>(row[x]) - mean) * inv;
-        }
-        for (int x = nx; x < na * nb; x++) {
-            dst[x] = 0.0;
+            double ss = 0.0;
+            for (int x = 0; x < nx; x++) {
+                double v = static_cast<double>(row[x]) - mean;
+                ss += v * v;
+            }
+            const double inv = (ss > 0.0) ? 1.0 / std::sqrt(ss) : 0.0;
+
+            double4_t *dst = &T[static_cast<size_t>(jb) * nx];
+            for (int x = 0; x < nx; x++) {
+                dst[x][lane] = (static_cast<double>(row[x]) - mean) * inv;
+            }
         }
     }
 
-    constexpr int nd = 3;
-    const int nc = (ny + nd - 1) / nd;
+    // Store a 4x4 block of correlations: result[i + j*ny] for j <= i.
+    auto store = [&](int ib, int jb, double4_t r0, double4_t r1,
+                     double4_t r2, double4_t r3) {
+        const double4_t rr[4] = {r0, r1, r2, r3};
+        for (int a = 0; a < nb; a++) {
+            const int i = ib * nb + a;
+            if (i >= ny) continue;
+            for (int b = 0; b < nb; b++) {
+                const int j = jb * nb + b;
+                if (j < ny && j <= i) {
+                    result[i + static_cast<size_t>(j) * ny] =
+                        static_cast<float>(rr[a][b]);
+                }
+            }
+        }
+    };
 
+    // ---- Compute X * X^T using packed rows (outer-product micro-kernel) ----
     #pragma omp parallel for schedule(dynamic, 1)
-    for (int ic = 0; ic < nc; ic++) {
-        for (int jc = 0; jc <= ic; jc++) {
-            const int ir = ic * nd;
-            const int jr = jc * nd;
+    for (int ib = 0; ib < nyb; ib++) {
+        const double4_t *Ti = &T[static_cast<size_t>(ib) * nx];
 
-            const double4_t *ri[nd];
-            const double4_t *rj[nd];
-            for (int id = 0; id < nd; id++) {
-                int r = std::min(ir + id, ny - 1);
-                ri[id] = &nor[static_cast<size_t>(r) * na];
-            }
-            for (int jd = 0; jd < nd; jd++) {
-                int r = std::min(jr + jd, ny - 1);
-                rj[jd] = &nor[static_cast<size_t>(r) * na];
-            }
+        int jb = 0;
+        // Process two j-blocks at a time: 4 i-rows x 8 j-rows per inner step.
+        for (; jb + 1 <= ib; jb += 2) {
+            const double4_t *Tj0 = &T[static_cast<size_t>(jb) * nx];
+            const double4_t *Tj1 = &T[static_cast<size_t>(jb + 1) * nx];
 
-            double4_t vsum[nd][nd];
-            for (int id = 0; id < nd; id++) {
-                for (int jd = 0; jd < nd; jd++) {
-                    vsum[id][jd] = d4zero;
-                }
-            }
+            double4_t a0 = d4zero, a1 = d4zero, a2 = d4zero, a3 = d4zero;
+            double4_t c0 = d4zero, c1 = d4zero, c2 = d4zero, c3 = d4zero;
 
-            for (int k = 0; k < na; k++) {
-                double4_t x0 = ri[0][k];
-                double4_t x1 = ri[1][k];
-                double4_t x2 = ri[2][k];
-                double4_t y0 = rj[0][k];
-                double4_t y1 = rj[1][k];
-                double4_t y2 = rj[2][k];
-                vsum[0][0] += x0 * y0; vsum[0][1] += x0 * y1; vsum[0][2] += x0 * y2;
-                vsum[1][0] += x1 * y0; vsum[1][1] += x1 * y1; vsum[1][2] += x1 * y2;
-                vsum[2][0] += x2 * y0; vsum[2][1] += x2 * y1; vsum[2][2] += x2 * y2;
+            for (int k = 0; k < nx; k++) {
+                double4_t vi = Ti[k];
+                double4_t u0 = Tj0[k];
+                double4_t u1 = Tj1[k];
+                double4_t b0 = {vi[0], vi[0], vi[0], vi[0]};
+                double4_t b1 = {vi[1], vi[1], vi[1], vi[1]};
+                double4_t b2 = {vi[2], vi[2], vi[2], vi[2]};
+                double4_t b3 = {vi[3], vi[3], vi[3], vi[3]};
+                a0 += b0 * u0; a1 += b1 * u0; a2 += b2 * u0; a3 += b3 * u0;
+                c0 += b0 * u1; c1 += b1 * u1; c2 += b2 * u1; c3 += b3 * u1;
             }
 
-            for (int id = 0; id < nd; id++) {
-                int i = ir + id;
-                if (i >= ny) continue;
-                for (int jd = 0; jd < nd; jd++) {
-                    int j = jr + jd;
-                    if (j < ny && j <= i) {
-                        result[i + static_cast<size_t>(j) * ny] = static_cast<float>(hsum4(vsum[id][jd]));
-                    }
-                }
+            store(ib, jb, a0, a1, a2, a3);
+            store(ib, jb + 1, c0, c1, c2, c3);
+        }
+
+        if (jb <= ib) {
+            const double4_t *Tj0 = &T[static_cast<size_t>(jb) * nx];
+            double4_t a0 = d4zero, a1 = d4zero, a2 = d4zero, a3 = d4zero;
+
+            for (int k = 0; k < nx; k++) {
+                double4_t vi = Ti[k];
+                double4_t u0 = Tj0[k];
+                a0 += (double4_t){vi[0], vi[0], vi[0], vi[0]} * u0;
+                a1 += (double4_t){vi[1], vi[1], vi[1], vi[1]} * u0;
+                a2 += (double4_t){vi[2], vi[2], vi[2], vi[2]} * u0;
+                a3 += (double4_t){vi[3], vi[3], vi[3], vi[3]} * u0;
             }
+
+            store(ib, jb, a0, a1, a2, a3);
         }
     }
 }
