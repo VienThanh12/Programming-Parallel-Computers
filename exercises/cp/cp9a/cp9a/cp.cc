@@ -1,179 +1,135 @@
 #include <cmath>
 #include <vector>
 #include <cstddef>
+#include <cstring>
+#include <algorithm>
+#include <omp.h>
 
-typedef double double4_t __attribute__ ((vector_size (4 * sizeof(double))));
+// SIMD width (doubles per vector): 8 on AVX-512 hardware, otherwise 4.
+#if defined(__AVX512F__)
+static constexpr int VW = 8;
+#else
+static constexpr int VW = 4;
+#endif
 
-constexpr double4_t d4zero {0.0, 0.0, 0.0, 0.0};
+typedef double dvec __attribute__ ((vector_size (VW * sizeof(double))));
 
-static inline double4_t bcast(double v) {
-    return (double4_t){v, v, v, v};
+// Register-blocking micro-kernel dimensions (MR rows x NR cols).
+// NR == 2 * VW == two SIMD vectors of doubles.
+static constexpr int MR = 6;
+static constexpr int NR = 2 * VW;
+
+// Smallest row count divisible by both MR and NR (so every micro-tile is full).
+static constexpr int PAD = (VW == 8) ? 48 : 24;
+
+// Cache-blocking dimensions.
+//   KC : panel depth (k dimension)
+//   MC : rows of A kept resident in L2 (multiple of MR)
+//   NC : cols of B kept resident in L3 (multiple of NR and MC)
+static constexpr int KC = 256;
+static constexpr int MC = 72;
+static constexpr int NC = 4032;
+
+static inline dvec bcast(double x) {
+    dvec v;
+    for (int i = 0; i < VW; i++) v[i] = x;
+    return v;
 }
 
-static inline double4_t loadu(const double *p) {
-    return (double4_t){p[0], p[1], p[2], p[3]};
+static inline dvec loadu(const double *p) {
+    dvec v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
 }
 
-static inline void storeu(double *p, double4_t v) {
-    p[0] = v[0]; p[1] = v[1]; p[2] = v[2]; p[3] = v[3];
+static inline void storeu(double *p, dvec v) {
+    std::memcpy(p, &v, sizeof(v));
 }
 
-static void base_mul(int m, int k, int n,
-                     const double *A, int lda,
-                     const double *B, int ldb,
-                     double *C, int ldc) {
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (int i0 = 0; i0 < m; i0 += 6) {
-        const double *a0 = A + static_cast<size_t>(i0 + 0) * lda;
-        const double *a1 = A + static_cast<size_t>(i0 + 1) * lda;
-        const double *a2 = A + static_cast<size_t>(i0 + 2) * lda;
-        const double *a3 = A + static_cast<size_t>(i0 + 3) * lda;
-        const double *a4 = A + static_cast<size_t>(i0 + 4) * lda;
-        const double *a5 = A + static_cast<size_t>(i0 + 5) * lda;
-
-        for (int j0 = 0; j0 < n; j0 += 8) {
-            double4_t r00 = d4zero, r01 = d4zero;
-            double4_t r10 = d4zero, r11 = d4zero;
-            double4_t r20 = d4zero, r21 = d4zero;
-            double4_t r30 = d4zero, r31 = d4zero;
-            double4_t r40 = d4zero, r41 = d4zero;
-            double4_t r50 = d4zero, r51 = d4zero;
-
-            const double *bp = B + j0;
-            for (int d = 0; d < k; d++) {
-                double4_t b0 = loadu(bp + 0);
-                double4_t b1 = loadu(bp + 4);
-                bp += ldb;
-                double4_t av;
-                av = bcast(a0[d]); r00 += av * b0; r01 += av * b1;
-                av = bcast(a1[d]); r10 += av * b0; r11 += av * b1;
-                av = bcast(a2[d]); r20 += av * b0; r21 += av * b1;
-                av = bcast(a3[d]); r30 += av * b0; r31 += av * b1;
-                av = bcast(a4[d]); r40 += av * b0; r41 += av * b1;
-                av = bcast(a5[d]); r50 += av * b0; r51 += av * b1;
-            }
-
-            double *c0 = C + static_cast<size_t>(i0 + 0) * ldc + j0;
-            double *c1 = C + static_cast<size_t>(i0 + 1) * ldc + j0;
-            double *c2 = C + static_cast<size_t>(i0 + 2) * ldc + j0;
-            double *c3 = C + static_cast<size_t>(i0 + 3) * ldc + j0;
-            double *c4 = C + static_cast<size_t>(i0 + 4) * ldc + j0;
-            double *c5 = C + static_cast<size_t>(i0 + 5) * ldc + j0;
-            storeu(c0 + 0, r00); storeu(c0 + 4, r01);
-            storeu(c1 + 0, r10); storeu(c1 + 4, r11);
-            storeu(c2 + 0, r20); storeu(c2 + 4, r21);
-            storeu(c3 + 0, r30); storeu(c3 + 4, r31);
-            storeu(c4 + 0, r40); storeu(c4 + 4, r41);
-            storeu(c5 + 0, r50); storeu(c5 + 4, r51);
+// Pack a panel of "count" consecutive rows of X (row-major, leading dim ldX)
+// over the k-range [k0, k0+kk) into "dst" with layout dst[k*count + r].
+// "count" is MR (for A) or NR (for B).
+static inline void pack_panel(double *dst, const double *X, int ldX,
+                              int row0, int count, int k0, int kk) {
+    for (int r = 0; r < count; r++) {
+        const double *src = X + static_cast<size_t>(row0 + r) * ldX + k0;
+        for (int k = 0; k < kk; k++) {
+            dst[k * count + r] = src[k];
         }
     }
 }
 
-static void madd(int r, int c,
-                 const double *A, int lda,
-                 const double *B, int ldb,
-                 double sign, double *D, int ldd) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < r; i++) {
-        const double *ar = A + static_cast<size_t>(i) * lda;
-        const double *br = B + static_cast<size_t>(i) * ldb;
-        double *dr = D + static_cast<size_t>(i) * ldd;
-        for (int j = 0; j < c; j++) dr[j] = ar[j] + sign * br[j];
+// Pack an MC-block of A (rows [i0, i0+mc)) into Ap, panel by panel of MR rows.
+static void pack_A(double *Ap, const double *X, int ldX,
+                   int i0, int mc, int k0, int kk) {
+    double *dst = Ap;
+    for (int ir = 0; ir < mc; ir += MR) {
+        pack_panel(dst, X, ldX, i0 + ir, MR, k0, kk);
+        dst += static_cast<size_t>(MR) * kk;
     }
 }
 
-static void strassen(int m, int k, int n,
-                     const double *A, int lda,
-                     const double *B, int ldb,
-                     double *C, int ldc, int levels) {
-    if (levels == 0) {
-        base_mul(m, k, n, A, lda, B, ldb, C, ldc);
-        return;
-    }
-
-    const int m2 = m / 2, k2 = k / 2, n2 = n / 2;
-
-    const double *A11 = A;
-    const double *A12 = A + k2;
-    const double *A21 = A + static_cast<size_t>(m2) * lda;
-    const double *A22 = A + static_cast<size_t>(m2) * lda + k2;
-
-    const double *B11 = B;
-    const double *B12 = B + n2;
-    const double *B21 = B + static_cast<size_t>(k2) * ldb;
-    const double *B22 = B + static_cast<size_t>(k2) * ldb + n2;
-
-    double *C11 = C;
-    double *C12 = C + n2;
-    double *C21 = C + static_cast<size_t>(m2) * ldc;
-    double *C22 = C + static_cast<size_t>(m2) * ldc + n2;
-
-    std::vector<double> M1(static_cast<size_t>(m2) * n2);
-    std::vector<double> M2(static_cast<size_t>(m2) * n2);
-    std::vector<double> M3(static_cast<size_t>(m2) * n2);
-    std::vector<double> M4(static_cast<size_t>(m2) * n2);
-    std::vector<double> M5(static_cast<size_t>(m2) * n2);
-    std::vector<double> M6(static_cast<size_t>(m2) * n2);
-    std::vector<double> M7(static_cast<size_t>(m2) * n2);
-
-    std::vector<double> TA(static_cast<size_t>(m2) * k2);
-    std::vector<double> TB(static_cast<size_t>(k2) * n2);
-
-    madd(m2, k2, A11, lda, A22, lda, +1.0, TA.data(), k2);
-    madd(k2, n2, B11, ldb, B22, ldb, +1.0, TB.data(), n2);
-    strassen(m2, k2, n2, TA.data(), k2, TB.data(), n2, M1.data(), n2, levels - 1);
-
-    madd(m2, k2, A21, lda, A22, lda, +1.0, TA.data(), k2);
-    strassen(m2, k2, n2, TA.data(), k2, B11, ldb, M2.data(), n2, levels - 1);
-
-    madd(k2, n2, B12, ldb, B22, ldb, -1.0, TB.data(), n2);
-    strassen(m2, k2, n2, A11, lda, TB.data(), n2, M3.data(), n2, levels - 1);
-
-    madd(k2, n2, B21, ldb, B11, ldb, -1.0, TB.data(), n2);
-    strassen(m2, k2, n2, A22, lda, TB.data(), n2, M4.data(), n2, levels - 1);
-
-    madd(m2, k2, A11, lda, A12, lda, +1.0, TA.data(), k2);
-    strassen(m2, k2, n2, TA.data(), k2, B22, ldb, M5.data(), n2, levels - 1);
-
-    madd(m2, k2, A21, lda, A11, lda, -1.0, TA.data(), k2);
-    madd(k2, n2, B11, ldb, B12, ldb, +1.0, TB.data(), n2);
-    strassen(m2, k2, n2, TA.data(), k2, TB.data(), n2, M6.data(), n2, levels - 1);
-
-    madd(m2, k2, A12, lda, A22, lda, -1.0, TA.data(), k2);
-    madd(k2, n2, B21, ldb, B22, ldb, +1.0, TB.data(), n2);
-    strassen(m2, k2, n2, TA.data(), k2, TB.data(), n2, M7.data(), n2, levels - 1);
-
+// Pack an NC-block of B (== columns j of X^T == rows j of X) into Bp,
+// panel by panel of NR columns. Panels are independent, so parallelise.
+static void pack_B(double *Bp, const double *X, int ldX,
+                   int j0, int nc, int k0, int kk) {
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < m2; i++) {
-        const size_t o = static_cast<size_t>(i) * n2;
-        double *c11 = C11 + static_cast<size_t>(i) * ldc;
-        double *c12 = C12 + static_cast<size_t>(i) * ldc;
-        double *c21 = C21 + static_cast<size_t>(i) * ldc;
-        double *c22 = C22 + static_cast<size_t>(i) * ldc;
-        for (int j = 0; j < n2; j++) {
-            const double m1 = M1[o + j], m2v = M2[o + j], m3 = M3[o + j];
-            const double m4 = M4[o + j], m5 = M5[o + j], m6 = M6[o + j], m7 = M7[o + j];
-            c11[j] = m1 + m4 - m5 + m7;
-            c12[j] = m3 + m5;
-            c21[j] = m2v + m4;
-            c22[j] = m1 - m2v + m3 + m6;
-        }
+    for (int jr = 0; jr < nc; jr += NR) {
+        double *dst = Bp + static_cast<size_t>(jr / NR) * NR * kk;
+        pack_panel(dst, X, ldX, j0 + jr, NR, k0, kk);
     }
+}
+
+// Micro-kernel: C[0..MR, 0..NR] += Ap_panel * Bp_panel  (depth kk).
+// Ap_panel[k*MR + r], Bp_panel[k*NR + c]. C has leading dimension ldc.
+static inline void micro_kernel(const double *Ap, const double *Bp,
+                                double *C, int ldc, int kk) {
+    const dvec dzero = bcast(0.0);
+    dvec r00 = dzero, r01 = dzero;
+    dvec r10 = dzero, r11 = dzero;
+    dvec r20 = dzero, r21 = dzero;
+    dvec r30 = dzero, r31 = dzero;
+    dvec r40 = dzero, r41 = dzero;
+    dvec r50 = dzero, r51 = dzero;
+
+    for (int k = 0; k < kk; k++) {
+        dvec b0 = loadu(Bp + k * NR + 0);
+        dvec b1 = loadu(Bp + k * NR + VW);
+        const double *a = Ap + k * MR;
+        // GCC vector extensions broadcast the scalar across the vector.
+        r00 += a[0] * b0; r01 += a[0] * b1;
+        r10 += a[1] * b0; r11 += a[1] * b1;
+        r20 += a[2] * b0; r21 += a[2] * b1;
+        r30 += a[3] * b0; r31 += a[3] * b1;
+        r40 += a[4] * b0; r41 += a[4] * b1;
+        r50 += a[5] * b0; r51 += a[5] * b1;
+    }
+
+    double *c0 = C + 0 * ldc;
+    double *c1 = C + 1 * ldc;
+    double *c2 = C + 2 * ldc;
+    double *c3 = C + 3 * ldc;
+    double *c4 = C + 4 * ldc;
+    double *c5 = C + 5 * ldc;
+    storeu(c0 + 0, loadu(c0 + 0) + r00); storeu(c0 + VW, loadu(c0 + VW) + r01);
+    storeu(c1 + 0, loadu(c1 + 0) + r10); storeu(c1 + VW, loadu(c1 + VW) + r11);
+    storeu(c2 + 0, loadu(c2 + 0) + r20); storeu(c2 + VW, loadu(c2 + VW) + r21);
+    storeu(c3 + 0, loadu(c3 + 0) + r30); storeu(c3 + VW, loadu(c3 + VW) + r31);
+    storeu(c4 + 0, loadu(c4 + 0) + r40); storeu(c4 + VW, loadu(c4 + VW) + r41);
+    storeu(c5 + 0, loadu(c5 + 0) + r50); storeu(c5 + VW, loadu(c5 + VW) + r51);
 }
 
 void correlate(int ny, int nx, const float *data, float *result) {
-    int levels = 0;
-    for (int t = ny; levels < 2 && t >= 2048; t /= 2) levels++;
+    if (ny <= 0) return;
 
-    const int PADM = (1 << levels) * 48;
-    const int PADK = (1 << levels);
+    const int K = nx;
+    // Pad the row count up to a multiple of lcm(MR, NR) so that every
+    // micro-tile is full (padded rows are zero and contribute nothing).
+    const int Mp = ((ny + PAD - 1) / PAD) * PAD;
 
-    const int M = ((ny + PADM - 1) / PADM) * PADM;
-    const int K = ((nx + PADK - 1) / PADK) * PADK;
+    std::vector<double> X(static_cast<size_t>(Mp) * K, 0.0);
 
-    std::vector<double> A(static_cast<size_t>(M) * K, 0.0);
-    std::vector<double> B(static_cast<size_t>(K) * M, 0.0);
-
+    // Normalise each real row to zero mean and unit length.
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < ny; i++) {
         const float *row = &data[static_cast<size_t>(i) * nx];
@@ -188,22 +144,58 @@ void correlate(int ny, int nx, const float *data, float *result) {
         }
         const double inv = (ss > 0.0) ? 1.0 / std::sqrt(ss) : 0.0;
 
-        double *ar = &A[static_cast<size_t>(i) * K];
+        double *xr = &X[static_cast<size_t>(i) * K];
         for (int x = 0; x < nx; x++) {
-            double val = (static_cast<double>(row[x]) - mean) * inv;
-            ar[x] = val;
-            B[static_cast<size_t>(x) * M + i] = val;
+            xr[x] = (static_cast<double>(row[x]) - mean) * inv;
         }
     }
 
-    std::vector<double> C(static_cast<size_t>(M) * M);
-    strassen(M, K, M, A.data(), K, B.data(), M, C.data(), M, levels);
+    // C = X * X^T (only the lower triangle i >= j is needed), accumulated in
+    // double precision, then written to the float result.
+    std::vector<double> C(static_cast<size_t>(Mp) * Mp, 0.0);
 
+    const int nthreads = std::max(1, omp_get_max_threads());
+    std::vector<double> Apbuf(static_cast<size_t>(nthreads) * MC * KC);
+    std::vector<double> Bp(static_cast<size_t>(KC) * NC);
+
+    for (int jc = 0; jc < Mp; jc += NC) {
+        const int nc = std::min(NC, Mp - jc);
+        for (int kc = 0; kc < K; kc += KC) {
+            const int kk = std::min(KC, K - kc);
+            pack_B(Bp.data(), X.data(), K, jc, nc, kc, kk);
+
+            // jc is a multiple of MC, so all rows below jc are entirely above
+            // the diagonal for these columns and can be skipped.
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int ic = jc; ic < Mp; ic += MC) {
+                const int mc = std::min(MC, Mp - ic);
+                double *Ap = &Apbuf[static_cast<size_t>(omp_get_thread_num()) * MC * KC];
+                pack_A(Ap, X.data(), K, ic, mc, kc, kk);
+
+                for (int jr = 0; jr < nc; jr += NR) {
+                    const double *Bpanel =
+                        Bp.data() + static_cast<size_t>(jr / NR) * NR * kk;
+                    const int jcol = jc + jr;
+                    for (int ir = 0; ir < mc; ir += MR) {
+                        const int irow = ic + ir;
+                        // Skip micro-tiles that lie fully above the diagonal.
+                        if (irow + MR - 1 < jcol) continue;
+                        const double *Apanel =
+                            Ap + static_cast<size_t>(ir / MR) * MR * kk;
+                        double *Ctile = &C[static_cast<size_t>(irow) * Mp + jcol];
+                        micro_kernel(Apanel, Bpanel, Ctile, Mp, kk);
+                    }
+                }
+            }
+        }
+    }
+
+    // Write the lower triangle (i >= j) into the result.
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < ny; j++) {
-        const double *cr = &C[static_cast<size_t>(j) * M];
         for (int i = j; i < ny; i++) {
-            result[i + static_cast<size_t>(j) * ny] = static_cast<float>(cr[i]);
+            result[i + static_cast<size_t>(j) * ny] =
+                static_cast<float>(C[static_cast<size_t>(i) * Mp + j]);
         }
     }
 }
