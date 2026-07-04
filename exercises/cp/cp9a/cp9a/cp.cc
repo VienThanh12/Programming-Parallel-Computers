@@ -59,7 +59,6 @@ static inline void pack_panel(double *dst, const double *X, int ldX,
     }
 }
 
-// Pack an MC-block of A (rows [i0, i0+mc)) into Ap, panel by panel of MR rows.
 static void pack_A(double *Ap, const double *X, int ldX,
                    int i0, int mc, int k0, int kk) {
     double *dst = Ap;
@@ -69,8 +68,6 @@ static void pack_A(double *Ap, const double *X, int ldX,
     }
 }
 
-// Pack an NC-block of B (== columns j of X^T == rows j of X) into Bp,
-// panel by panel of NR columns. Panels are independent, so parallelise.
 static void pack_B(double *Bp, const double *X, int ldX,
                    int j0, int nc, int k0, int kk) {
     #pragma omp parallel for schedule(static)
@@ -80,8 +77,6 @@ static void pack_B(double *Bp, const double *X, int ldX,
     }
 }
 
-// Micro-kernel: C[0..MR, 0..NR] += Ap_panel * Bp_panel  (depth kk).
-// Ap_panel[k*MR + r], Bp_panel[k*NR + c]. C has leading dimension ldc.
 static inline void micro_kernel(const double *Ap, const double *Bp,
                                 double *C, int ldc, int kk) {
     const dvec dzero = bcast(0.0);
@@ -96,7 +91,6 @@ static inline void micro_kernel(const double *Ap, const double *Bp,
         dvec b0 = loadu(Bp + k * NR + 0);
         dvec b1 = loadu(Bp + k * NR + VW);
         const double *a = Ap + k * MR;
-        // GCC vector extensions broadcast the scalar across the vector.
         r00 += a[0] * b0; r01 += a[0] * b1;
         r10 += a[1] * b0; r11 += a[1] * b1;
         r20 += a[2] * b0; r21 += a[2] * b1;
@@ -123,13 +117,10 @@ void correlate(int ny, int nx, const float *data, float *result) {
     if (ny <= 0) return;
 
     const int K = nx;
-    // Pad the row count up to a multiple of lcm(MR, NR) so that every
-    // micro-tile is full (padded rows are zero and contribute nothing).
     const int Mp = ((ny + PAD - 1) / PAD) * PAD;
 
     std::vector<double> X(static_cast<size_t>(Mp) * K, 0.0);
 
-    // Normalise each real row to zero mean and unit length.
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < ny; i++) {
         const float *row = &data[static_cast<size_t>(i) * nx];
@@ -150,8 +141,6 @@ void correlate(int ny, int nx, const float *data, float *result) {
         }
     }
 
-    // C = X * X^T (only the lower triangle i >= j is needed), accumulated in
-    // double precision, then written to the float result.
     std::vector<double> C(static_cast<size_t>(Mp) * Mp, 0.0);
 
     const int nthreads = std::max(1, omp_get_max_threads());
@@ -164,8 +153,6 @@ void correlate(int ny, int nx, const float *data, float *result) {
             const int kk = std::min(KC, K - kc);
             pack_B(Bp.data(), X.data(), K, jc, nc, kc, kk);
 
-            // jc is a multiple of MC, so all rows below jc are entirely above
-            // the diagonal for these columns and can be skipped.
             #pragma omp parallel for schedule(dynamic, 1)
             for (int ic = jc; ic < Mp; ic += MC) {
                 const int mc = std::min(MC, Mp - ic);
@@ -178,7 +165,6 @@ void correlate(int ny, int nx, const float *data, float *result) {
                     const int jcol = jc + jr;
                     for (int ir = 0; ir < mc; ir += MR) {
                         const int irow = ic + ir;
-                        // Skip micro-tiles that lie fully above the diagonal.
                         if (irow + MR - 1 < jcol) continue;
                         const double *Apanel =
                             Ap + static_cast<size_t>(ir / MR) * MR * kk;
@@ -190,7 +176,6 @@ void correlate(int ny, int nx, const float *data, float *result) {
         }
     }
 
-    // Write the lower triangle (i >= j) into the result.
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < ny; j++) {
         for (int i = j; i < ny; i++) {
